@@ -30,7 +30,7 @@ testSize = -1  # -1 for all
 exampleSize = (512, 512)
 inputSize = (256, 256)
 maskSize = (256, 256)
-batchSize = 64
+batchSize = 8
 epochs = 20  # 100
 learning_rate = 1e-4
 numClasses = 2
@@ -40,10 +40,10 @@ epochs = int(epochs)
 batchSize = int(batchSize)
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-# modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".hdf5"
-modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".keras"
-resultsPath = "membrane/test/predict/predict" + "E" + str(epochs) + "_LR" + str(learning_rate)
-logs_folder = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp
+# modelFileName = "unet_gta5_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".hdf5"
+modelFileName = "unet_gta5_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".keras"
+resultsPath = "gta5/test/predict/predict" + "E" + str(epochs) + "_LR" + str(learning_rate)
+logs_folder = "unet_gta5_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp
 
 augmentation_args = dict(
     width_shift_range=range(256),
@@ -177,34 +177,22 @@ def augmentImage(image, inputSize, mask, maskSize, aug_dict):
 
 def trainGenerator(batch_size, trainSetX, trainSetY, aug_dict, inputSize=(256, 256), inputChannels=1,
                    maskSize=(256, 256), numClasses=2):
-    if batch_size > 0:
-        while 1:
-            iTile = 0
-            nBatches = int(np.ceil(len(trainSetX) / batch_size))
-            for batchID in range(nBatches):
-                images = np.zeros(((batch_size,) + inputSize + (inputChannels,)))  # 1 channel
-                masks = np.zeros(((batch_size,) + maskSize + (numClasses,)))
-                iTileInBatch = 0
-                while iTileInBatch < batch_size:
-                    if iTile < len(trainSetX):
-                        # print(iTile, "/", len(trainSetX), ";", iTileInBatch, "/", batch_size, ";", trainSetX[iTile], trainSetY[iTile])
-
-                        image = getImageChannels(trainSetX[iTile])
-                        mask = skimage_io.imread(trainSetY[iTile], as_gray=True)
-                        mask = normalizeMask(mask)
-                        image, mask = augmentImage(image, inputSize, mask, maskSize, aug_dict)
-                        for i in range(len(image)):
-                            images[iTileInBatch, :, :, i] = image[i]
-                        masks[iTileInBatch, :, :, :] = mask
-
-                        iTile = iTile + 1
-                        iTileInBatch = iTileInBatch + 1
-                    else:
-                        images = images[0:iTileInBatch, :, :, :]
-                        masks = masks[0:iTileInBatch, :, :, :]
-                        break
-                yield images, masks
-
+    while True:
+        nBatches = int(np.ceil(len(trainSetX) / batch_size))
+        for batchID in range(nBatches):
+            images = np.zeros(((batch_size,) + inputSize + (inputChannels,)))  # 1 channel
+            masks = np.zeros(((batch_size,) + maskSize + (numClasses,)))
+            iTileInBatch = 0
+            for iTile in range(batchID * batch_size, min((batchID + 1) * batch_size, len(trainSetX))):
+                image = getImageChannels(trainSetX[iTile])
+                mask = skimage_io.imread(trainSetY[iTile], as_gray=True)
+                mask = normalizeMask(mask)
+                image, mask = augmentImage(image, inputSize, mask, maskSize, aug_dict)
+                for i in range(len(image)):
+                    images[iTileInBatch, :, :, i] = image[i]
+                masks[iTileInBatch, :, :, :] = mask
+                iTileInBatch += 1
+            yield images, masks
 
 def unetCustom(pretrained_weights=None, inputSize=(256, 256, 1), numClass=2):
     inputs = tf.keras.layers.Input(inputSize)
@@ -420,7 +408,7 @@ def main():
                     callbacks=[model_checkpoint,
                                tensorboard_callback],
                     validation_data=valGene,
-                    validation_steps=validationSteps)   
+                    validation_steps=validationSteps, verbose=1)       
 
     # load best model
     model = unetCustom(pretrained_weights=modelFilePath,

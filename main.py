@@ -41,7 +41,7 @@ maskSize = (256, 256)
 batchSize = 4
 epochs = 20  # 100
 learning_rate = 1e-4
-numClasses = 13629
+numClasses = 20
 showImages = False
 
 epochs = int(epochs)

@@ -34,7 +34,7 @@ maskSize = (256, 256)
 batchSize = 4
 epochs = 20  # 100
 learning_rate = 1e-4
-numClasses = 2
+numClasses = 3
 showImages = False
 
 epochs = int(epochs)
@@ -70,7 +70,7 @@ def split(datasetPath, train_ratio=0.6, val_ratio=0.2):
 
 split(datasetPath, train_ratio=0.6, val_ratio=0.2)
 
-# DATA AUGMENTATION
+# DATA augATION
 def randomCrop(image, mask, size):
     # assert image.shape == mask.shape
     assert image.shape[0] >= size[0]
@@ -104,18 +104,18 @@ class dataGenerator(tf.keras.utils.Sequence):
         self.aug = aug
     
     def __len__(self):
-        return len(np.ceil(len(os.listdir(self.imagesPath)) / self.batchSize))
+        return int(np.ceil(len(self.imagesPath) / self.batchSize))
     
     def __getitem__(self, index):
-        batchImages = os.listdir(self.imagesPath)[index * self.batchSize:(index + 1) * self.batchSize]
-        batchMasks = os.listdir(self.masksPath)[index * self.batchSize:(index + 1) * self.batchSize]
+        batchImages = self.imagesPath[index * self.batchSize:(index + 1) * self.batchSize]
+        batchMasks = self.masksPath[index * self.batchSize:(index + 1) * self.batchSize]
 
         images = []
         masks = []
 
         for img, mask in zip(batchImages, batchMasks):
-            image = skimage_io.imread(os.path.join(self.imagesPath, img))
-            mask = skimage_io.imread(os.path.join(self.masksPath, mask))
+            image = skimage_io.imread(img)
+            mask = skimage_io.imread(mask)
 
             if self.aug:
                 image, mask = randomCrop(image, mask, self.imageSize)
@@ -222,9 +222,9 @@ def main():
     val_masks = [path.replace("images", "masks") for path in val_images]
     test_masks = [path.replace("images", "masks") for path in test_images]
 
-    train_generator = dataGenerator(train_images, train_masks, batch_size=batchSize, image_size=(256, 256), augment=True)
-    val_generator = dataGenerator(val_images, val_masks, batch_size=batchSize, image_size=(256, 256), augment=False)
-    test_generator = dataGenerator(test_images, test_masks, batch_size=batchSize, image_size=(256, 256), augment=False)
+    train_generator = dataGenerator(train_images, train_masks, batchSize=batchSize, imageSize=(256, 256), aug=True)
+    val_generator = dataGenerator(val_images, val_masks, batchSize=batchSize, imageSize=(256, 256), aug=False)
+    test_generator = dataGenerator(test_images, test_masks, batchSize=batchSize, imageSize=(256, 256), aug=False)
 
     # TRAIN MODEL
     history = model.fit(train_generator, epochs=epochs, validation_data=val_generator, callbacks=[checkpoint_callback, tensorboard_callback, early_stopping_callback])

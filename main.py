@@ -1,3 +1,7 @@
+# semantic segmentation with Unet
+# heavily inspired on https://github.com/zhixuhao/unet
+# uses isbi dataset
+
 import os
 import matplotlib.pyplot as plt
 import skimage.io as skimage_io
@@ -6,23 +10,11 @@ import random as r
 import numpy as np
 import datetime
 import tensorflow as tf
-from tensorflow.keras.callbacks import (
-    EarlyStopping,
-    ModelCheckpoint,
-    TensorBoard,
-    Callback,
-)
-from sklearn.metrics import (
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    f1_score,
-    accuracy_score,
-)
-import shutil
+import tensorflow.keras
+from tensorflow.keras.utils import plot_model
 
 print("Tensorflow {}".format(tf.__version__))
-print("GPU devices: {}".format(tf.config.list_physical_devices("GPU")))
+print("GPU devices: {}".format(tf.config.list_physical_devices('GPU')))
 
 # import PIL.Image as PImage
 
@@ -38,559 +30,445 @@ testSize = -1  # -1 for all
 exampleSize = (512, 512)
 inputSize = (256, 256)
 maskSize = (256, 256)
-batchSize = 4
+batchSize = 64
 epochs = 20  # 100
 learning_rate = 1e-4
-numClasses = 20
+numClasses = 2
 showImages = False
 
 epochs = int(epochs)
 batchSize = int(batchSize)
 
-os.makedirs(modelsPath, exist_ok=True)
+timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+# modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".hdf5"
+modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".keras"
+resultsPath = "membrane/test/predict/predict" + "E" + str(epochs) + "_LR" + str(learning_rate)
+logs_folder = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp
+
+augmentation_args = dict(
+    width_shift_range=range(256),
+    height_shift_range=range(256),
+    rotation_range=[0, 90, 180, 270],
+    horizontal_flip=True,
+    vertical_flip=True
+)
+
+def prepareDataset(datasetPath, trainFolder, valFolder, testFolder):
+    trainSetX = []
+    trainSetY = []
+    valSetX = []
+    valSetY = []
+    testSetX = []
+
+    trainImagesPath = os.path.join(datasetPath, trainFolder, "image")
+    trainMasksPath = os.path.join(datasetPath, trainFolder, "label")
+    trainSetFolder = os.scandir(trainImagesPath)
+
+    for tile in trainSetFolder:
+        imagePath = tile.path
+        trainSetX.append(imagePath)
+        if (showImages):
+            image = skimage_io.imread(imagePath)
+            maskPath = os.path.join(trainMasksPath, os.path.basename(imagePath))
+            mask = skimage_io.imread(maskPath)
+            plt.figure(figsize=(6, 3))
+            plt.subplot(1, 2, 1)
+            plt.grid(False)
+            plt.xticks([])
+            plt.yticks([])
+            plt.imshow(image, cmap='gray')
+            plt.xlabel("Image - {}".format(os.path.basename(imagePath)))
+            plt.subplot(1, 2, 2)
+            plt.grid(False)
+            plt.xticks([])
+            plt.yticks([])
+            plt.imshow(mask, cmap='gray')
+            plt.xlabel("Mask")
+            plt.show()
+
+    r.shuffle(trainSetX)
+    for trainExample in trainSetX:
+        maskPath = os.path.join(trainMasksPath, os.path.basename(trainExample))
+        trainSetY.append(maskPath)
+
+    valImagesPath = os.path.join(datasetPath, valFolder, "image")
+    valSetXFolder = os.scandir(valImagesPath)
+    for tile in valSetXFolder:
+        imagePath = tile.path
+        valSetX.append(imagePath)
+    valMasksPath = os.path.join(datasetPath, valFolder, "label")
+    valSetYFolder = os.scandir(valMasksPath)
+    for tile in valSetYFolder:
+        maskPath = tile.path
+        valSetY.append(maskPath)
+
+    testImagesPath = os.path.join(datasetPath, testFolder, "image")
+    testSetFolder = os.scandir(testImagesPath)
+    for tile in testSetFolder:
+        imagePath = tile.path
+        testSetX.append(imagePath)
+
+    return trainSetX, trainSetY, valSetX, valSetY, testSetX
 
 
-# SPLIT DATASET
-def split(datasetPath, train_ratio=0.6, val_ratio=0.2):
-    imagesPath = os.path.join(datasetPath, "images")
-    masksPath = os.path.join(datasetPath, "masks")
-
-    allImages = os.listdir(imagesPath)
-    r.shuffle(allImages)
-
-    totalImages = len(allImages)
-    trainCount = int(totalImages * train_ratio)
-    valCount = int(totalImages * val_ratio)
-
-    trainImages = allImages[:trainCount]
-    valImages = allImages[trainCount : trainCount + valCount]
-    testImages = allImages[trainCount + valCount :]
-
-    def copyFiles(files, dest):
-        os.makedirs(dest, exist_ok=True)
-        for file in files:
-            shutil.copy(os.path.join(imagesPath, file), os.path.join(dest, file))
-            shutil.copy(os.path.join(masksPath, file), os.path.join(dest, file))
-
-    copyFiles(trainImages, os.path.join(datasetPath, trainFolder))
-    copyFiles(valImages, os.path.join(datasetPath, valFolder))
-    copyFiles(testImages, os.path.join(datasetPath, testFolder))
+def normalizeMask(mask, num_class=2):
+    mask = mask / 255
+    new_mask = np.zeros(mask.shape + (num_class,))
+    for i in range(num_class):
+        new_mask[mask == i, i] = 1.
+    return new_mask
 
 
-split(datasetPath, train_ratio=0.6, val_ratio=0.2)
+def normalizeChannel(channel):
+    return (channel - 127.5) / 127.5
 
 
-# DATA AUGMENTATION
-def randomCrop(image, mask, size):
-    # assert image.shape == mask.shape
-    assert image.shape[0] >= size[0]
-    assert image.shape[1] >= size[1]
-
-    x = r.randint(0, image.shape[1] - size[1] + 1)
-    y = r.randint(0, image.shape[0] - size[0] + 1)
-
-    return (
-        image[y : y + size[0], x : x + size[1]],
-        mask[y : y + size[0], x : x + size[1]],
-    )
+def getImageChannels(tile):
+    channel0 = skimage_io.imread(tile, as_gray=True)
+    channel0 = normalizeChannel(channel0)
+    return [channel0]
 
 
-def randomFlip(image, mask):
-    if r.random() > 0.5:
-        image = np.fliplr(image)
-        mask = np.fliplr(mask)
+def augmentImage(image, inputSize, mask, maskSize, aug_dict):
+    if 'width_shift_range' in aug_dict:
+        cropx = r.sample(aug_dict['width_shift_range'], 1)[0]
+    else:
+        cropx = (int)((image[0].shape[1] - inputSize[1]) / 2)
+    if 'height_shift_range' in aug_dict:
+        cropy = r.sample(aug_dict['height_shift_range'], 1)[0]
+    else:
+        cropy = (int)((image[0].shape[0] - inputSize[0]) / 2)
+    if 'rotation_range' in aug_dict:
+        rotation = r.sample(aug_dict['rotation_range'], 1)[0]
+    else:
+        rotation = 0
+    if 'horizontal_flip' in aug_dict and aug_dict['horizontal_flip']:
+        do_horizontal_flip = r.sample([False, True], 1)[0]
+    else:
+        do_horizontal_flip = False
+    if 'vertical_flip' in aug_dict and aug_dict['vertical_flip']:
+        do_vertical_flip = r.sample([False, True], 1)[0]
+    else:
+        do_vertical_flip = False
+
+    maskOffsety = int((inputSize[0] - maskSize[0]) / 2)
+    maskOffsetx = int((inputSize[1] - maskSize[1]) / 2)
+    mask = mask[maskOffsety + cropy:maskOffsety + cropy + maskSize[0],
+           maskOffsetx + cropx:maskOffsetx + cropx + maskSize[1]]
+    if rotation:
+        mask = skimage_transform.rotate(mask, rotation)
+    if do_horizontal_flip:
+        mask = mask[:, ::-1]
+    if do_vertical_flip:
+        mask = mask[::-1, :]
+
+    for i in range(len(image)):
+        channel = image[i]
+        channel = channel[cropy:cropy + inputSize[0], cropx:cropx + inputSize[1]]
+        if rotation:
+            channel = skimage_transform.rotate(channel, rotation)
+        if do_horizontal_flip:
+            channel = channel[:, ::-1]
+        if do_vertical_flip:
+            channel = channel[::-1, :]
+        image[i] = channel
     return image, mask
 
 
-# def randomRotate(image, mask):
-#     angle = r.choice([0, 90, 180, 270])
-#     image = skimage_transform.rotate(image, angle)
-#     mask = skimage_transform.rotate(mask, angle)
-#     return image, mask
+def trainGenerator(batch_size, trainSetX, trainSetY, aug_dict, inputSize=(256, 256), inputChannels=1,
+                   maskSize=(256, 256), numClasses=2):
+    if batch_size > 0:
+        while 1:
+            iTile = 0
+            nBatches = int(np.ceil(len(trainSetX) / batch_size))
+            for batchID in range(nBatches):
+                images = np.zeros(((batch_size,) + inputSize + (inputChannels,)))  # 1 channel
+                masks = np.zeros(((batch_size,) + maskSize + (numClasses,)))
+                iTileInBatch = 0
+                while iTileInBatch < batch_size:
+                    if iTile < len(trainSetX):
+                        # print(iTile, "/", len(trainSetX), ";", iTileInBatch, "/", batch_size, ";", trainSetX[iTile], trainSetY[iTile])
+
+                        image = getImageChannels(trainSetX[iTile])
+                        mask = skimage_io.imread(trainSetY[iTile], as_gray=True)
+                        mask = normalizeMask(mask)
+                        image, mask = augmentImage(image, inputSize, mask, maskSize, aug_dict)
+                        for i in range(len(image)):
+                            images[iTileInBatch, :, :, i] = image[i]
+                        masks[iTileInBatch, :, :, :] = mask
+
+                        iTile = iTile + 1
+                        iTileInBatch = iTileInBatch + 1
+                    else:
+                        images = images[0:iTileInBatch, :, :, :]
+                        masks = masks[0:iTileInBatch, :, :, :]
+                        break
+                yield images, masks
 
 
-# DATA GENERATOR
-class DataGenerator(tf.keras.utils.Sequence):
-
-    def __init__(self, imagesPath, masksPath, batchSize, imageSize, numClasses, aug=None):
-        self.imagesPath = imagesPath
-        self.masksPath = masksPath
-        self.batchSize = batchSize
-        self.imageSize = imageSize
-        self.num_classes = numClasses
-        self.aug = aug
-
-    def __len__(self):
-        return int(np.ceil(len(self.imagesPath) / self.batchSize))
-
-    def __getitem__(self, index):
-        batchImages = self.imagesPath[
-            index * self.batchSize : (index + 1) * self.batchSize
-        ]
-        batchMasks = self.masksPath[
-            index * self.batchSize : (index + 1) * self.batchSize
-        ]
-
-        images = []
-        masks = []
-
-        for img, mask in zip(batchImages, batchMasks):
-            image = skimage_io.imread(img)
-            mask = skimage_io.imread(mask)
-
-            if self.aug:
-                image, mask = randomCrop(image, mask, self.imageSize)
-                image, mask = randomFlip(image, mask)
-
-            image = skimage_transform.resize(image, self.imageSize)
-            mask = skimage_transform.resize(mask, self.imageSize)
-
-            # NORMALIZE
-            image = image / 255.0
-
-            # CONVERT MASK TO CATEGORICAL
-            # mask = np.expand_dims(mask, axis=-1)
-            # mask = tf.keras.utils.to_categorical(mask, num_classes=numClasses)
-            # mask = np.squeeze(mask, axis=-2)
-
-            mask = self.rgb_to_class(mask)
-
-            # Validate mask values are within the range [0, num_classes - 1]
-            unique_values = np.unique(mask)
-            if np.any(unique_values >= self.num_classes) or np.any(unique_values < 0):
-                raise ValueError(f"Mask contains invalid values: {unique_values}")
-        
-            mask = tf.keras.utils.to_categorical(mask, num_classes=self.num_classes)
-
-            images.append(image)
-            masks.append(mask)
-
-        return np.array(images), np.array(masks)
-
-
-    def rgb_to_class(self, mask):
-        unique_colors = np.unique(mask.reshape(-1, mask.shape[2]), axis=0)
-        color_to_class = {tuple(color): idx for idx, color in enumerate(unique_colors)}
-        
-        # Check if number of unique colors exceeds expected number of classes
-        if len(unique_colors) > self.num_classes:
-            raise ValueError(f"Found {len(unique_colors)} unique colors but expected only {self.num_classes}. Unique colors: {unique_colors}")
-        
-        class_mask = np.zeros(mask.shape[:2], dtype=np.int32)
-        for color, idx in color_to_class.items():
-            class_mask[np.all(mask == color, axis=-1)] = idx
-        return class_mask
-
-def test_mask_conversion(data_generator):
-    for i in range(len(data_generator)):
-        images, masks = data_generator[i]
-        print(f"Batch {i}: images shape {images.shape}, masks shape {masks.shape}")
-        unique_values = np.unique(masks)
-        print(f"Unique mask values: {unique_values}")
-        if np.any(unique_values >= data_generator.num_classes) or np.any(unique_values < 0):
-            raise ValueError(f"Mask contains invalid values: {unique_values}")
-        if i == 1:  # Only test the first two batches
-            break
-
-# MODEL
-def unet_model(input_size=(256, 256, 3), num_classes=2):
-    inputs = tf.keras.layers.Input(input_size)
-    conv1 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(inputs)
-    conv1 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(conv1)
+def unetCustom(pretrained_weights=None, inputSize=(256, 256, 1), numClass=2):
+    inputs = tf.keras.layers.Input(inputSize)
+    conv1 = tf.keras.layers.Conv2D(64, 3, padding='same', kernel_initializer='he_normal')(inputs)
+    conv1 = tf.keras.layers.Activation('relu')(conv1)
+    conv1 = tf.keras.layers.Conv2D(64, 3, padding='same', kernel_initializer='he_normal')(conv1)
+    conv1 = tf.keras.layers.Activation('relu')(conv1)
     pool1 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv1)
-
-    conv2 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(pool1)
-    conv2 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(conv2)
+    conv2 = tf.keras.layers.Conv2D(128, 3, padding='same', kernel_initializer='he_normal')(pool1)
+    conv2 = tf.keras.layers.Activation('relu')(conv2)
+    conv2 = tf.keras.layers.Conv2D(128, 3, padding='same', kernel_initializer='he_normal')(conv2)
+    conv2 = tf.keras.layers.Activation('relu')(conv2)
     pool2 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv2)
-
-    conv3 = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same")(pool2)
-    conv3 = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same")(conv3)
+    conv3 = tf.keras.layers.Conv2D(256, 3, padding='same', kernel_initializer='he_normal')(pool2)
+    conv3 = tf.keras.layers.Activation('relu')(conv3)
+    conv3 = tf.keras.layers.Conv2D(256, 3, padding='same', kernel_initializer='he_normal')(conv3)
+    conv3 = tf.keras.layers.Activation('relu')(conv3)
     pool3 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv3)
+    conv4 = tf.keras.layers.Conv2D(512, 3, padding='same', kernel_initializer='he_normal')(pool3)
+    conv4 = tf.keras.layers.Activation('relu')(conv4)
+    conv4 = tf.keras.layers.Conv2D(512, 3, padding='same', kernel_initializer='he_normal')(conv4)
+    conv4 = tf.keras.layers.Activation('relu')(conv4)
+    drop4 = tf.keras.layers.Dropout(0.5)(conv4)
+    pool4 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(drop4)
 
-    conv4 = tf.keras.layers.Conv2D(512, 3, activation="relu", padding="same")(pool3)
-    conv4 = tf.keras.layers.Conv2D(512, 3, activation="relu", padding="same")(conv4)
-    pool4 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv4)
+    conv5 = tf.keras.layers.Conv2D(1024, 3, padding='same', kernel_initializer='he_normal')(pool4)
+    conv5 = tf.keras.layers.Activation('relu')(conv5)
+    conv5 = tf.keras.layers.Conv2D(1024, 3, padding='same', kernel_initializer='he_normal')(conv5)
+    conv5 = tf.keras.layers.Activation('relu')(conv5)
+    drop5 = tf.keras.layers.Dropout(0.5)(conv5)
 
-    conv5 = tf.keras.layers.Conv2D(1024, 3, activation="relu", padding="same")(pool4)
-    conv5 = tf.keras.layers.Conv2D(1024, 3, activation="relu", padding="same")(conv5)
+    up6 = tf.keras.layers.Conv2D(512, 2, padding='same', kernel_initializer='he_normal')(tf.keras.layers.UpSampling2D(size=(2, 2))(drop5))
+    up6 = tf.keras.layers.Activation('relu')(up6)
+    merge6 = tf.keras.layers.concatenate([drop4, up6], axis=3)
+    conv6 = tf.keras.layers.Conv2D(512, 3, padding='same', kernel_initializer='he_normal')(merge6)
+    conv6 = tf.keras.layers.Activation('relu')(conv6)
+    conv6 = tf.keras.layers.Conv2D(512, 3, padding='same', kernel_initializer='he_normal')(conv6)
+    conv6 = tf.keras.layers.Activation('relu')(conv6)
 
-    up6 = tf.keras.layers.Conv2D(512, 2, activation="relu", padding="same")(
-        tf.keras.layers.UpSampling2D(size=(2, 2))(conv5)
-    )
-    merge6 = tf.keras.layers.concatenate([conv4, up6], axis=3)
-    conv6 = tf.keras.layers.Conv2D(512, 3, activation="relu", padding="same")(merge6)
-    conv6 = tf.keras.layers.Conv2D(512, 3, activation="relu", padding="same")(conv6)
-
-    up7 = tf.keras.layers.Conv2D(256, 2, activation="relu", padding="same")(
-        tf.keras.layers.UpSampling2D(size=(2, 2))(conv6)
-    )
+    up7 = tf.keras.layers.Conv2D(256, 2, padding='same', kernel_initializer='he_normal')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv6))
+    up7 = tf.keras.layers.Activation('relu')(up7)
     merge7 = tf.keras.layers.concatenate([conv3, up7], axis=3)
-    conv7 = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same")(merge7)
-    conv7 = tf.keras.layers.Conv2D(256, 3, activation="relu", padding="same")(conv7)
+    conv7 = tf.keras.layers.Conv2D(256, 3, padding='same', kernel_initializer='he_normal')(merge7)
+    conv7 = tf.keras.layers.Activation('relu')(conv7)
+    conv7 = tf.keras.layers.Conv2D(256, 3, padding='same', kernel_initializer='he_normal')(conv7)
+    conv7 = tf.keras.layers.Activation('relu')(conv7)
 
-    up8 = tf.keras.layers.Conv2D(128, 2, activation="relu", padding="same")(
-        tf.keras.layers.UpSampling2D(size=(2, 2))(conv7)
-    )
+    up8 = tf.keras.layers.Conv2D(128, 2, padding='same', kernel_initializer='he_normal')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv7))
+    up8 = tf.keras.layers.Activation('relu')(up8)
     merge8 = tf.keras.layers.concatenate([conv2, up8], axis=3)
-    conv8 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(merge8)
-    conv8 = tf.keras.layers.Conv2D(128, 3, activation="relu", padding="same")(conv8)
+    conv8 = tf.keras.layers.Conv2D(128, 3, padding='same', kernel_initializer='he_normal')(merge8)
+    conv8 = tf.keras.layers.Activation('relu')(conv8)
+    conv8 = tf.keras.layers.Conv2D(128, 3, padding='same', kernel_initializer='he_normal')(conv8)
+    conv8 = tf.keras.layers.Activation('relu')(conv8)
 
-    up9 = tf.keras.layers.Conv2D(64, 2, activation="relu", padding="same")(
-        tf.keras.layers.UpSampling2D(size=(2, 2))(conv8)
-    )
+    up9 = tf.keras.layers.Conv2D(64, 2, padding='same', kernel_initializer='he_normal')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv8))
+    up9 = tf.keras.layers.Activation('relu')(up9)
     merge9 = tf.keras.layers.concatenate([conv1, up9], axis=3)
-    conv9 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(merge9)
-    conv9 = tf.keras.layers.Conv2D(64, 3, activation="relu", padding="same")(conv9)
-    conv9 = tf.keras.layers.Conv2D(
-        num_classes, 1, activation="softmax", padding="same"
-    )(conv9)
+    conv9 = tf.keras.layers.Conv2D(64, 3, padding='same', kernel_initializer='he_normal')(merge9)
+    conv9 = tf.keras.layers.Activation('relu')(conv9)
+    conv9 = tf.keras.layers.Conv2D(64, 3, padding='same', kernel_initializer='he_normal')(conv9)
+    conv9 = tf.keras.layers.Activation('relu')(conv9)
+    conv10 = tf.keras.layers.Conv2D(numClass, 1, activation='softmax', kernel_initializer='he_normal')(conv9)
 
-    model = tf.keras.Model(inputs=inputs, outputs=conv9)
+    model = tf.keras.models.Model(inputs=inputs, outputs=conv10)
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    model.summary()
+
+    if (pretrained_weights):
+        model.load_weights(pretrained_weights)
+
     return model
 
 
-# CUSTOM CALLBACK FOR VISUALIZATION
-class imageCallback(Callback):
-    def __init__(self, val_gen, log_dir, num_images=3):
-        super().__init__()
-        self.val_gen = val_gen
-        self.log_dir = log_dir
-        self.num_images = num_images
-        self.file_writer = tf.summary.create_file_writer(log_dir)
+def do_center_crop(image, newSize):
+    cropy = (int)((image[0].shape[0] - newSize[0]) / 2)
+    cropx = (int)((image[0].shape[1] - newSize[1]) / 2)
+    for i in range(len(image)):
+        channel = image[i]
+        channel = channel[cropy:image[0].shape[0] - cropy, cropx:image[0].shape[1] - cropx]
+        image[i] = channel
 
-    def on_epoch_end(self, epoch, logs=None):
-        val_images, val_masks = next(iter(self.val_gen))
-        predictions = self.model.predict(val_images)
+    return image
 
-        with self.file_writer.as_default():
-            for i in range(self.num_images):
-                tf.summary.image("image", val_images[i : i + 1], step=epoch)
-                tf.summary.image("mask", val_masks[i : i + 1], step=epoch)
-                tf.summary.image("prediction", predictions[i : i + 1], step=epoch)
+
+def testGenerator(testSetX, inputSize=(256, 256), inputChannels=1):
+    for tile in testSetX:
+        image = getImageChannels(tile)
+        image = do_center_crop(image, inputSize)
+        img = np.zeros(inputSize + (inputChannels,))
+        for i in range(len(image)):
+            img[:, :, i] = image[i]
+
+        img = np.array([img])
+        yield img
+
+
+def do_center_crop_channel(image, newSize):
+    cropy = (int)((image.shape[0] - newSize[0]) / 2)
+    cropx = (int)((image.shape[1] - newSize[1]) / 2)
+    return image[cropy:image.shape[0] - cropy, cropx:image.shape[1] - cropx]
+
+
+def saveResults(testSetX, results, resultsPath):
+    for i, item in enumerate(results):
+        filename = testSetX[i]
+        mask_predict = np.argmax(item, axis=-1)
+        mask_predict = mask_predict.astype(np.uint8)
+        mask_predict = mask_predict * 255
+        skimage_io.imsave(os.path.join(resultsPath, os.path.basename(filename) + "_predict.png"), mask_predict)
+        if (showImages):
+            imagePath = filename
+            image = skimage_io.imread(imagePath)
+            image = do_center_crop_channel(image, newSize=(256, 256))
+
+            plt.figure(figsize=(6, 3))
+            plt.subplot(1, 2, 1)
+            plt.grid(False)
+            plt.xticks([])
+            plt.yticks([])
+            plt.imshow(image, cmap='gray')
+            plt.xlabel("Image - {}".format(os.path.basename(imagePath)))
+            plt.subplot(1, 2, 2)
+            plt.grid(False)
+            plt.xticks([])
+            plt.yticks([])
+            plt.imshow(mask_predict, cmap='gray')
+            plt.xlabel("Predicted Mask")
+            plt.show()
+
+
+def moving_average(a, n=3):
+    ret = np.cumsum(a, dtype=float)
+    ret[n:] = ret[n:] - ret[:-n]
+    return ret[n - 1:] / n
+
+
+class BatchLossHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs={}):
+        self.batch_losses = []
+        self.batch_accuracies = []
+
+    def on_batch_end(self, batch, logs={}):
+        self.batch_losses.append(logs.get('loss'))
+        self.batch_accuracies.append(logs.get('accuracy'))
 
 
 def main():
+    r.seed(1)
+    trainSetX, trainSetY, valSetX, valSetY, testSetX = prepareDataset(datasetPath=datasetPath,
+                                                                      trainFolder=trainFolder,
+                                                                      valFolder=valFolder,
+                                                                      testFolder=testFolder)
+    # batch_history = BatchLossHistory()
+    if trainSize > 0:
+        trainSetX = trainSetX[0:trainSize]
+        trainSetY = trainSetY[0:trainSize]
+    if valSize > 0:
+        valSetX = valSetX[0:valSize]
+        valSetY = valSetY[0:valSize]
+    if testSize > 0:
+        testSetX = testSetX[0:testSize]
 
-    # CALLBACKS
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    # modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".hdf5"
-    modelFileName = (
-        "unet_membrane_"
-        + "E"
-        + str(epochs)
-        + "_LR"
-        + str(learning_rate)
-        + "_"
-        + timestamp
-        + ".keras"
-    )
-    # resultsPath = "membrane/test/predict/predict" + "E" + str(epochs) + "_LR" + str(learning_rate)
-    # logs_folder = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp
-    checkpoint_callback = ModelCheckpoint(
-        modelFileName, monitor="val_loss", save_best_only=True
-    )
-    tensorboard_callback = TensorBoard(log_dir=f"logs/{timestamp}")
-    early_stopping_callback = EarlyStopping(monitor="val_loss", patience=10)
-    # image_callback = ImageCallback(val_generator=val_generator, log_dir=f"logs/{timestamp}")
+    trainGene = trainGenerator(batchSize,
+                               trainSetX,
+                               trainSetY,
+                               augmentation_args,
+                               inputSize=inputSize,
+                               inputChannels=1,
+                               maskSize=maskSize,
+                               numClasses=numClasses)
+    valGene = trainGenerator(batchSize,
+                             valSetX,
+                             valSetY,
+                             dict(),
+                             inputSize=inputSize,
+                             inputChannels=1,
+                             maskSize=maskSize,
+                             numClasses=numClasses)
 
-    # COMPILE MODEL
-    model = unet_model(input_size=(256, 256, 3), num_classes=numClasses)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
-    )
+    modelFilePath = os.path.join(modelsPath, modelFileName)
+    model = unetCustom(inputSize=(256, 256, 1),
+                       numClass=2)
+    plot_model(model,
+               to_file='modelUnet.png',
+               show_shapes=True,
+               show_dtype=True,
+               show_layer_names=True,
+               rankdir='LR',
+               expand_nested=True)
+    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(modelFilePath,
+                                                          monitor='val_loss',
+                                                          verbose=1,
+                                                          save_best_only=True)
+    log_dir = os.path.join("logs", "fit", logs_folder)
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                          histogram_freq=1)
 
-    # PREPARE DATA GENERATORS
-    train_images = [
-        os.path.join(datasetPath, trainFolder, fname)
-        for fname in os.listdir(os.path.join(datasetPath, trainFolder))
-        if fname.endswith(".png") or fname.endswith(".jpg")
-    ]
-    val_images = [
-        os.path.join(datasetPath, valFolder, fname)
-        for fname in os.listdir(os.path.join(datasetPath, valFolder))
-        if fname.endswith(".png") or fname.endswith(".jpg")
-    ]
-    test_images = [
-        os.path.join(datasetPath, testFolder, fname)
-        for fname in os.listdir(os.path.join(datasetPath, testFolder))
-        if fname.endswith(".png") or fname.endswith(".jpg")
-    ]
+    Ntrain = len(trainSetX)
+    # stepsPerEpoch = np.ceil(Ntrain / batchSize)
+    stepsPerEpoch = int(np.ceil(Ntrain / batchSize))
 
-    train_masks = [path.replace("images", "masks") for path in train_images]
-    val_masks = [path.replace("images", "masks") for path in val_images]
-    test_masks = [path.replace("images", "masks") for path in test_images]
+    Nval = len(valSetX)
+    # validationSteps = np.ceil(Nval / batchSize)
+    validationSteps = int(np.ceil(Nval / batchSize))
 
-     # Initialize data generators
-    train_generator = DataGenerator(train_images, train_masks, batchSize=batchSize, imageSize=inputSize, numClasses=numClasses, aug=True)
-    test_mask_conversion(train_generator)
-    val_generator = DataGenerator(val_images, val_masks, batchSize=batchSize, imageSize=inputSize, numClasses=numClasses, aug=False)
-    test_generator = DataGenerator(test_images, test_masks, batchSize=batchSize, imageSize=inputSize, numClasses=numClasses, aug=False)
+    history = model.fit(trainGene,
+                    steps_per_epoch=stepsPerEpoch,
+                    epochs=epochs,
+                    callbacks=[model_checkpoint,
+                               tensorboard_callback],
+                    validation_data=valGene,
+                    validation_steps=validationSteps)   
 
-    # Compile model
-    model = unet_model(input_size=(256, 256, 3), num_classes=numClasses)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(optimizer=optimizer, loss='categorical_crossentropy', metrics=['accuracy'])
+    # load best model
+    model = unetCustom(pretrained_weights=modelFilePath,
+                       inputSize=(256, 256, 1),
+                       numClass=2)
 
-    # Train model
-    history = model.fit(train_generator, epochs=epochs, validation_data=val_generator, callbacks=[checkpoint_callback, tensorboard_callback, early_stopping_callback])
+    testGene = testGenerator(testSetX, inputSize=inputSize, inputChannels=1)
+    NTest = len(testSetX)
+    testSteps = np.ceil(NTest / batchSize)
+    results = model.predict(testGene, verbose=1)
+    if not os.path.exists(resultsPath):
+        os.makedirs(resultsPath)
+    saveResults(testSetX, results, resultsPath)
 
-    # Evaluate model
-    true_labels = []
-    predictions = []
-
-    for batch in test_generator:
-        images, labels = batch
-        print(f"Images shape: {images.shape}, Labels shape: {labels.shape}")
-        preds = model.predict(images)
-        print(f"Predictions shape: {preds.shape}")
-        true_labels.append(np.argmax(labels, axis=-1).flatten())
-        predictions.append(np.argmax(preds, axis=-1).flatten())
-
-    true_labels = np.concatenate(true_labels)
-    predictions = np.concatenate(predictions)
-
-    # Calculate evaluation metrics
-    conf_matrix = confusion_matrix(true_labels, predictions)
-    precision = precision_score(true_labels, predictions, average='weighted')
-    recall = recall_score(true_labels, predictions, average='weighted')
-    f1 = f1_score(true_labels, predictions, average='weighted')
-    accuracy = accuracy_score(true_labels, predictions)
-
-    print("Confusion Matrix:\n", conf_matrix)
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"F1 Score: {f1:.4f}")
-    print(f"Accuracy: {accuracy:.4f}")
-
-    # PLOT TRAINING HISTORY
-
-    plt.plot(history.history["accuracy"])
-    plt.plot(history.history["val_accuracy"])
-    plt.title("model accuracy")
-    plt.ylabel("accuracy")
-    plt.xlabel("epoch")
-
-    plt.plot(history.history["loss"])
-    plt.plot(history.history["val_loss"])
-    plt.title("model loss")
-    plt.ylabel("loss")
-    plt.xlabel("epoch")
-    plt.legend(["train", "test"], loc="upper left")
-    plt.show()
-
-    # SAVE MODEL
-    model.save(modelFileName)
-    model.save_weights(modelFileName + ".h5")
-
-
-if __name__ == "__main__":
-    main()
-
-    copyFiles(testImages, os.path.join(datasetPath, testFolder))
-
-split(datasetPath, train_ratio=0.6, val_ratio=0.2)
-
-# DATA augATION
-def randomCrop(image, mask, size):
-    # assert image.shape == mask.shape
-    assert image.shape[0] >= size[0]
-    assert image.shape[1] >= size[1]
-
-    x = r.randint(0, image.shape[1] - size[1]+1)
-    y = r.randint(0, image.shape[0] - size[0]+1)
-
-    return image[y:y + size[0], x:x + size[1]], mask[y:y + size[0], x:x + size[1]]
-
-def randomFlip(image, mask):
-    if r.random() > 0.5:
-        image = np.fliplr(image)
-        mask = np.fliplr(mask)
-    return image, mask
-
-# def randomRotate(image, mask):
-#     angle = r.choice([0, 90, 180, 270])
-#     image = skimage_transform.rotate(image, angle)
-#     mask = skimage_transform.rotate(mask, angle)
-#     return image, mask
-
-# DATA GENERATOR
-class dataGenerator(tf.keras.utils.Sequence):
-
-    def __init__(self, imagesPath, masksPath, batchSize, imageSize, aug=None):
-        self.imagesPath = imagesPath
-        self.masksPath = masksPath
-        self.batchSize = batchSize
-        self.imageSize = imageSize
-        self.aug = aug
-    
-    def __len__(self):
-        return int(np.ceil(len(self.imagesPath) / self.batchSize))
-    
-    def __getitem__(self, index):
-        batchImages = self.imagesPath[index * self.batchSize:(index + 1) * self.batchSize]
-        batchMasks = self.masksPath[index * self.batchSize:(index + 1) * self.batchSize]
-
-        images = []
-        masks = []
-
-        for img, mask in zip(batchImages, batchMasks):
-            image = skimage_io.imread(img)
-            mask = skimage_io.imread(mask)
-
-            if self.aug:
-                image, mask = randomCrop(image, mask, self.imageSize)
-                image, mask = randomFlip(image, mask)
-
-            image = skimage_transform.resize(image, self.imageSize)
-            mask = skimage_transform.resize(mask, self.imageSize)
-
-            images.append(image)
-            masks.append(mask)
-
-        return np.array(images), np.array(masks)
-    
-
-# MODEL
-def unet_model(input_size=(256, 256, 3), num_classes=2):
-    inputs = tf.keras.layers.Input(input_size)
-    conv1 = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(inputs)
-    conv1 = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(conv1)
-    pool1 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv1)
-
-    conv2 = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='same')(pool1)
-    conv2 = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='same')(conv2)
-    pool2 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv2)
-
-    conv3 = tf.keras.layers.Conv2D(256, 3, activation='relu', padding='same')(pool2)
-    conv3 = tf.keras.layers.Conv2D(256, 3, activation='relu', padding='same')(conv3)
-    pool3 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv3)
-
-    conv4 = tf.keras.layers.Conv2D(512, 3, activation='relu', padding='same')(pool3)
-    conv4 = tf.keras.layers.Conv2D(512, 3, activation='relu', padding='same')(conv4)
-    pool4 = tf.keras.layers.MaxPooling2D(pool_size=(2, 2))(conv4)
-
-    conv5 = tf.keras.layers.Conv2D(1024, 3, activation='relu', padding='same')(pool4)
-    conv5 = tf.keras.layers.Conv2D(1024, 3, activation='relu', padding='same')(conv5)
-
-    up6 = tf.keras.layers.Conv2D(512, 2, activation='relu', padding='same')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv5))
-    merge6 = tf.keras.layers.concatenate([conv4, up6], axis=3)
-    conv6 = tf.keras.layers.Conv2D(512, 3, activation='relu', padding='same')(merge6)
-    conv6 = tf.keras.layers.Conv2D(512, 3, activation='relu', padding='same')(conv6)
-
-    up7 = tf.keras.layers.Conv2D(256, 2, activation='relu', padding='same')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv6))
-    merge7 = tf.keras.layers.concatenate([conv3, up7], axis=3)
-    conv7 = tf.keras.layers.Conv2D(256, 3, activation='relu', padding='same')(merge7)
-    conv7 = tf.keras.layers.Conv2D(256, 3, activation='relu', padding='same')(conv7)
-
-    up8 = tf.keras.layers.Conv2D(128, 2, activation='relu', padding='same')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv7))
-    merge8 = tf.keras.layers.concatenate([conv2, up8], axis=3)
-    conv8 = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='same')(merge8)
-    conv8 = tf.keras.layers.Conv2D(128, 3, activation='relu', padding='same')(conv8)
-
-    up9 = tf.keras.layers.Conv2D(64, 2, activation='relu', padding='same')(tf.keras.layers.UpSampling2D(size=(2, 2))(conv8))
-    merge9 = tf.keras.layers.concatenate([conv1, up9], axis=3)
-    conv9 = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(merge9)
-    conv9 = tf.keras.layers.Conv2D(64, 3, activation='relu', padding='same')(conv9)
-    conv9 = tf.keras.layers.Conv2D(num_classes, 1, activation='softmax', padding='same')(conv9)
-
-    model = tf.keras.Model(inputs=inputs, outputs=conv9)
-    return model
-
-# CUSTOM CALLBACK FOR VISUALIZATION
-class imageCallback(Callback):
-    def __init__(self, val_gen, log_dir, num_images=3):
-        super().__init__()
-        self.val_gen = val_gen
-        self.log_dir = log_dir
-        self.num_images = num_images
-        self.file_writer = tf.summary.create_file_writer(log_dir)
-
-    def on_epoch_end(self, epoch, logs=None):
-        val_images, val_masks = next(iter(self.val_gen))
-        predictions = self.model.predict(val_images)
-
-        with self.file_writer.as_default():
-            for i in range(self.num_images):
-                tf.summary.image("image", val_images[i:i+1], step=epoch)
-                tf.summary.image("mask", val_masks[i:i+1], step=epoch)
-                tf.summary.image("prediction", predictions[i:i+1], step=epoch)
-
-def main():
-
-    # CALLBACKS 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    # modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".hdf5"
-    modelFileName = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp + ".keras"
-    # resultsPath = "membrane/test/predict/predict" + "E" + str(epochs) + "_LR" + str(learning_rate)
-    # logs_folder = "unet_membrane_" + "E" + str(epochs) + "_LR" + str(learning_rate) + "_" + timestamp
-    checkpoint_callback = ModelCheckpoint(modelFileName, monitor='val_loss', save_best_only=True)
-    tensorboard_callback = TensorBoard(log_dir=f"logs/{timestamp}")
-    early_stopping_callback = EarlyStopping(monitor='val_loss', patience=10)
-    # image_callback = ImageCallback(val_generator=val_generator, log_dir=f"logs/{timestamp}")
-
-    # COMPILE MODEL
-    model = unet_model(input_size=(256, 256, 3), num_classes=numClasses)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss='categorical_crossentropy', metrics=['accuracy'])
-
-    # PREPARE DATA GENERATORS
-    train_images = [os.path.join(datasetPath, trainFolder, fname) for fname in os.listdir(os.path.join(datasetPath, trainFolder)) if fname.endswith('.png') or fname.endswith('.jpg')]
-    val_images = [os.path.join(datasetPath, valFolder, fname) for fname in os.listdir(os.path.join(datasetPath, valFolder)) if fname.endswith('.png') or fname.endswith('.jpg')]
-    test_images = [os.path.join(datasetPath, testFolder, fname) for fname in os.listdir(os.path.join(datasetPath, testFolder)) if fname.endswith('.png') or fname.endswith('.jpg')]
-
-    train_masks = [path.replace("images", "masks") for path in train_images]
-    val_masks = [path.replace("images", "masks") for path in val_images]
-    test_masks = [path.replace("images", "masks") for path in test_images]
-
-    train_generator = dataGenerator(train_images, train_masks, batchSize=batchSize, imageSize=(256, 256), aug=True)
-    val_generator = dataGenerator(val_images, val_masks, batchSize=batchSize, imageSize=(256, 256), aug=False)
-    test_generator = dataGenerator(test_images, test_masks, batchSize=batchSize, imageSize=(256, 256), aug=False)
-
-    # TRAIN MODEL
-    history = model.fit(train_generator, epochs=epochs, validation_data=val_generator, callbacks=[checkpoint_callback, tensorboard_callback, early_stopping_callback])
-
-    # EVALUATE MODEL
-    predictions = model.predict(test_generator)
-
-    # CALCULATE EVALUATION METRICS
-    true_labels = np.argmax(np.vstack(y for _, y in test_generator), axis=-1).flatten()
-
-    pred_labels = np.argmax(predictions, axis=-1).flatten()
-
-    confusion_matrix = tf.math.confusion_matrix(true_labels, pred_labels, num_classes=numClasses).numpy()
-    precision = precision_score(true_labels, pred_labels, average='weighted')
-    recall = recall_score(true_labels, pred_labels, average='weighted')
-    f1 = f1_score(true_labels, pred_labels, average='weighted')
-    accuracy = accuracy_score(true_labels, pred_labels)
-
-    print(f'Confusion Matrix: \n{confusion_matrix}')
-    print(f"Precision: {precision}")
-    print(f"Recall: {recall}")
-    print(f"F1: {f1}")
-    print(f"Accuracy: {accuracy}")
-
-    # PLOT TRAINING HISTORY
-
+    plt.subplot(1, 2, 1)
     plt.plot(history.history['accuracy'])
     plt.plot(history.history['val_accuracy'])
-    plt.title('model accuracy')
-    plt.ylabel('accuracy')
-    plt.xlabel('epoch')
+    plt.title('Model accuracy')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Val'], loc='lower right')
 
+    # Plot training & validation loss values
+    plt.subplot(1, 2, 2)
     plt.plot(history.history['loss'])
     plt.plot(history.history['val_loss'])
-    plt.title('model loss')
-    plt.ylabel('loss')
-    plt.xlabel('epoch')
-    plt.legend(['train', 'test'], loc='upper left')
+    plt.title('Model loss')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.legend(['Train', 'Val'], loc='upper right')
+
+    # plt.subplot(2, 2, 3)
+    # plt.plot(moving_average(batch_history.batch_accuracies, 5))
+    # plt.title('Model accuracy')
+    # plt.ylabel('Accuracy')
+    # plt.xlabel('Batch')
+    # plt.legend(['Train'], loc='lower right')
+    #
+    # # Plot training & validation loss values
+    # plt.subplot(2, 2, 4)
+    # plt.plot(moving_average(batch_history.batch_losses, 5))
+    # plt.title('Model loss')
+    # plt.ylabel('Loss')
+    # plt.xlabel('Batch')
+    # plt.legend(['Train'], loc='upper right')
+
     plt.show()
 
-    # SAVE MODEL
-    model.save(modelFileName)
-    model.save_weights(modelFileName + ".h5")
 
 if __name__ == '__main__':
     main()
